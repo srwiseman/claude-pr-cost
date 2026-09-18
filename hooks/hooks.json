@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash|mcp__.*create_pull_request.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/pr-cost/pr-session-cost.py\"",
+            "timeout": 45
+          }
+        ]
+      }
+    ]
+  }
+}

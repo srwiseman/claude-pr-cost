@@ -1,0 +1,9 @@
+{
+  "name": "pr-cost",
+  "version": "0.1.0",
+  "description": "Posts the Claude Code session's approximate token usage and API-equivalent cost as a comment when a PR is opened.",
+  "author": { "name": "Stephen Wiseman" },
+  "repository": "https://github.com/srwiseman/claude-pr-cost",
+  "license": "MIT",
+  "keywords": ["github", "pull-request", "tokens", "cost", "usage"]
+}

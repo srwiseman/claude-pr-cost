@@ -1,0 +1,14 @@
+{
+  "name": "claude-pr-cost",
+  "owner": {
+    "name": "Stephen Wiseman"
+  },
+  "plugins": [
+    {
+      "name": "pr-cost",
+      "source": "./",
+      "description": "Posts the Claude Code session's approximate token usage and API-equivalent cost as a comment when a PR is opened."
+    }
+  ],
+  "description": "Claude Code plugin that posts session token usage on PRs"
+}
