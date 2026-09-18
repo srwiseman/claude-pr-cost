@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Post this Claude Code session's approximate token usage as a comment on a PR.
+"""Keep a PR comment showing the approximate token usage of the Claude Code sessions behind it.
 
-Hook mode (PostToolUse, JSON on stdin): fires after a tool call that opened a PR
-  - Bash: `gh pr create`, or a POST to .../pulls via `gh api` / `curl`
-  - MCP:  any tool whose name contains create_pull_request
+Hook mode (PostToolUse, JSON on stdin) fires when a tool call:
+  - opens a PR: `gh pr create`, a POST to .../pulls via `gh api` / `curl`,
+    or an MCP tool whose name contains create_pull_request
+  - pushes a branch that has an open PR: `git push`
 Manual mode: pr-session-cost.py [PR_URL_OR_NUMBER] [--dry-run]
   Uses the newest transcript for the current directory and the current branch's PR.
+
+There is one comment per PR, edited in place. It keeps one row per session, so work from
+several sessions adds up. Per-session totals are stored in a hidden JSON block in the comment.
 
 Tokens are the headline because they mean the same thing on an API plan and on a
 Pro/Max subscription. The dollar figure is labelled as API-equivalent list price.
 """
+import datetime
 import glob
 import json
 import os
@@ -18,7 +23,7 @@ import subprocess
 import sys
 
 MARKER = "<!-- claude-session-cost -->"
-STATE_DIR = os.path.expanduser("~/.claude/state/pr-session-cost")
+DATA_RE = re.compile(r"<!-- claude-session-cost-data (.*?) -->", re.S)
 PR_URL_RE = re.compile(r"https://github\.com/([^/\s\"']+)/([^/\s\"']+)/pull/(\d+)")
 
 # $ per million tokens: (input, output). Cache pricing is derived from input:
@@ -63,6 +68,26 @@ def pr_opened(event):
     if tool.startswith("mcp__") and "create_pull_request" in tool:
         return m.group(0)
     return None
+
+
+def pushed(event):
+    """True if this tool call was a successful `git push`."""
+    if event.get("tool_name") != "Bash":
+        return False
+    cmd = event.get("tool_input", {}).get("command", "")
+    if not re.search(r"\bgit\s+(-C\s+\S+\s+)?push\b", cmd) or re.search(r"--dry-run|\s-n\b", cmd):
+        return False
+    resp = json.dumps(event.get("tool_response", ""))
+    return not re.search(r"\[rejected\]|fatal:|error: failed to push", resp)
+
+
+def open_pr_for_branch(cwd):
+    r = subprocess.run(["gh", "pr", "view", "--json", "url,state"], cwd=cwd,
+                       capture_output=True, text=True, timeout=20)
+    if r.returncode != 0:
+        return None
+    info = json.loads(r.stdout)
+    return info["url"] if info.get("state") == "OPEN" else None
 
 
 # ---------------------------------------------------------------- usage
@@ -124,6 +149,10 @@ def cost(model, t):
             + t["read"] * read + t["out"] * out) / 1e6
 
 
+def total_tokens(t):
+    return t["inp"] + t["w5"] + t["w1h"] + t["read"] + t["out"]
+
+
 def fmt(n):
     for div, suf in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
         if n >= div:
@@ -131,59 +160,119 @@ def fmt(n):
     return str(n)
 
 
-def render(by_model, session_id):
-    rows, total_tokens, total_cost, unpriced = [], 0, 0.0, False
-    for model, t in sorted(by_model.items(), key=lambda kv: -sum(v for k, v in kv[1].items() if k != "calls")):
-        tokens = t["inp"] + t["w5"] + t["w1h"] + t["read"] + t["out"]
-        c = cost(model, t)
-        total_tokens += tokens
-        if c is None:
-            unpriced = True
-        else:
-            total_cost += c
-        rows.append(
-            f"| `{model}` | {t['calls']} | {fmt(t['inp'] + t['w5'] + t['w1h'])} | {fmt(t['read'])} "
-            f"| {fmt(t['out'])} | {fmt(tokens)} | {'—' if c is None else f'${c:,.2f}'} |"
-        )
+def now_utc():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def render(sessions):
+    """sessions: {session_id: {"started": str, "updated": str, "models": {model: tally}}}"""
+    rows, grand_tokens, grand_cost, unpriced = [], 0, 0.0, False
+    ordered = sorted(sessions.items(), key=lambda kv: kv[1].get("started", ""))
+    for sid, s in ordered:
+        for model, t in sorted(s["models"].items(), key=lambda kv: -total_tokens(kv[1])):
+            tokens = total_tokens(t)
+            c = cost(model, t)
+            grand_tokens += tokens
+            if c is None:
+                unpriced = True
+            else:
+                grand_cost += c
+            rows.append(
+                f"| `{sid[:8]}` | `{model}` | {t['calls']} | {fmt(t['inp'] + t['w5'] + t['w1h'])} "
+                f"| {fmt(t['read'])} | {fmt(t['out'])} | {fmt(tokens)} | {'—' if c is None else f'${c:,.2f}'} |"
+            )
+    n = len(sessions)
     note = " (excludes models with unknown pricing)" if unpriced else ""
+    data = json.dumps(sessions, separators=(",", ":"))
     return "\n".join([
         MARKER,
-        f"### 🤖 Claude session cost: ~{fmt(total_tokens)} tokens",
+        f"### 🤖 Claude session cost: ~{fmt(grand_tokens)} tokens"
+        + (f" across {n} sessions" if n > 1 else ""),
         "",
-        "| Model | API calls | Input + cache write | Cache read | Output | Total tokens | API-equiv. $ |",
-        "|---|--:|--:|--:|--:|--:|--:|",
+        "| Session | Model | API calls | Input + cache write | Cache read | Output | Total tokens | API-equiv. $ |",
+        "|---|---|--:|--:|--:|--:|--:|--:|",
         *rows,
         "",
-        f"**API-equivalent cost:** ~${total_cost:,.2f}{note}. On a Pro/Max subscription this is "
-        "usage against plan limits, not a charge. Counted up to when the PR was opened; "
-        "includes subagents; list prices, so no batch/priority discounts.",
+        f"**API-equivalent cost:** ~${grand_cost:,.2f}{note}. On a Pro/Max subscription this is "
+        "usage against plan limits, not a charge. Each session is counted up to its latest "
+        "PR open or push; includes subagents; list prices, so no batch/priority discounts.",
         "",
-        f"<sub>session `{session_id}`</sub>",
+        f"<sub>Updated {now_utc()}</sub>",
+        f"<!-- claude-session-cost-data {data} -->",
     ])
 
 
-# ---------------------------------------------------------------- posting
+# ---------------------------------------------------------------- GitHub
 
-def post_comment(pr_url, body):
+def api(method, path, body=None):
+    """Call the GitHub REST API via gh, falling back to curl + GH_TOKEN/GITHUB_TOKEN."""
+    payload = json.dumps(body) if body is not None else None
     try:
-        r = subprocess.run(["gh", "pr", "comment", pr_url, "--body-file", "-"],
-                           input=body, text=True, capture_output=True, timeout=30)
+        args = ["gh", "api", "-X", method, path]
+        if method == "GET":
+            args.append("--paginate")
+        if payload is not None:
+            args += ["--input", "-"]
+        r = subprocess.run(args, input=payload, text=True, capture_output=True, timeout=30)
         if r.returncode == 0:
-            return True, r.stdout.strip()
+            return _parse_json_pages(r.stdout)
         err = r.stderr.strip()
     except (OSError, subprocess.TimeoutExpired) as e:
         err = str(e)
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if not token:
-        return False, err
+        raise RuntimeError(err)
+    args = ["curl", "-sS", "-f", "-X", method,
+            "-H", f"Authorization: Bearer {token}", "-H", "Accept: application/vnd.github+json",
+            f"https://api.github.com/{path}"]
+    if payload is not None:
+        args += ["--data-binary", "@-"]
+    r = subprocess.run(args, input=payload, text=True, capture_output=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"curl exited {r.returncode}")
+    return json.loads(r.stdout) if r.stdout.strip() else None
+
+
+def _parse_json_pages(text):
+    # `gh api --paginate` concatenates one JSON array per page.
+    text, out, dec, i = text.strip(), [], json.JSONDecoder(), 0
+    if not text:
+        return None
+    while i < len(text):
+        obj, i = dec.raw_decode(text, i)
+        if not isinstance(obj, list):
+            return obj
+        out.extend(obj)
+        while i < len(text) and text[i].isspace():
+            i += 1
+    return out
+
+
+def upsert(pr_url, session_id, models, dry=False):
+    """Merge this session into the PR's cost comment, creating the comment if needed."""
     owner, repo, num = PR_URL_RE.search(pr_url).groups()
-    r = subprocess.run(
-        ["curl", "-sS", "-f", "-X", "POST",
-         "-H", f"Authorization: Bearer {token}", "-H", "Accept: application/vnd.github+json",
-         f"https://api.github.com/repos/{owner}/{repo}/issues/{num}/comments",
-         "--data-binary", "@-"],
-        input=json.dumps({"body": body}), text=True, capture_output=True, timeout=30)
-    return r.returncode == 0, (r.stderr.strip() or "posted via REST API")
+    existing, sessions = None, {}
+    for c in api("GET", f"repos/{owner}/{repo}/issues/{num}/comments?per_page=100") or []:
+        if MARKER in (c.get("body") or ""):
+            existing = c
+    if existing:
+        m = DATA_RE.search(existing["body"])
+        if m:
+            try:
+                sessions = json.loads(m.group(1))
+            except ValueError:
+                sessions = {}
+    stamp = now_utc()
+    prev = sessions.get(session_id, {})
+    sessions[session_id] = {"started": prev.get("started", stamp), "updated": stamp, "models": models}
+    body = render(sessions)
+    if dry:
+        return body
+    if existing:
+        api("PATCH", f"repos/{owner}/{repo}/issues/comments/{existing['id']}", {"body": body})
+        return f"updated {existing['html_url']}"
+    c = api("POST", f"repos/{owner}/{repo}/issues/{num}/comments", {"body": body})
+    return f"posted {c.get('html_url', pr_url)}"
 
 
 # ---------------------------------------------------------------- entry points
@@ -203,38 +292,35 @@ def main():
         transcript = newest_transcript(os.getcwd())
         if not transcript:
             sys.exit("No transcript found for this directory.")
-        target = args[0] if args else ""
-        r = subprocess.run(["gh", "pr", "view", *([target] if target else []), "--json", "url", "-q", ".url"],
+        r = subprocess.run(["gh", "pr", "view", *args[:1], "--json", "url", "-q", ".url"],
                            capture_output=True, text=True)
         pr_url = r.stdout.strip()
-        if not pr_url and not dry:
-            sys.exit(f"Could not resolve PR: {r.stderr.strip()}")
-        body = render(tally(transcripts_for(transcript)), os.path.basename(transcript)[:-6])
-        if dry:
-            print(body)
+        session = os.path.basename(transcript)[: -len(".jsonl")]
+        models = tally(transcripts_for(transcript))
+        if dry and not pr_url:
+            print(render({session: {"started": now_utc(), "updated": now_utc(), "models": models}}))
             return
-        ok, msg = post_comment(pr_url, body)
-        print(msg if ok else f"Failed: {msg}")
-        sys.exit(0 if ok else 1)
+        if not pr_url:
+            sys.exit(f"Could not resolve PR: {r.stderr.strip()}")
+        try:
+            print(upsert(pr_url, session, models, dry=dry))
+        except RuntimeError as e:
+            sys.exit(f"Failed: {e}")
+        return
 
     # Hook mode: never fail the tool call
     try:
         event = json.load(sys.stdin)
-        pr_url = pr_opened(event)
         transcript = event.get("transcript_path")
-        if not pr_url or not transcript:
+        if not transcript:
             return
-        session = event.get("session_id", "unknown")
-        os.makedirs(STATE_DIR, exist_ok=True)
-        stamp = os.path.join(STATE_DIR, re.sub(r"\W", "_", f"{session}_{pr_url}"))
-        if os.path.exists(stamp):
+        pr_url = pr_opened(event)
+        if not pr_url and pushed(event):
+            pr_url = open_pr_for_branch(event.get("cwd") or os.getcwd())
+        if not pr_url:
             return
-        body = render(tally(transcripts_for(transcript)), session)
-        ok, msg = post_comment(pr_url, body)
-        if ok:
-            open(stamp, "w").close()
-        print(json.dumps({"systemMessage": f"PR session cost {'posted to' if ok else 'failed for'} {pr_url}"
-                          + ("" if ok else f": {msg}")}))
+        result = upsert(pr_url, event.get("session_id", "unknown"), tally(transcripts_for(transcript)))
+        print(json.dumps({"systemMessage": f"PR session cost {result}"}))
     except Exception as e:  # noqa: BLE001
         print(json.dumps({"systemMessage": f"pr-session-cost hook error: {e}"}))
 

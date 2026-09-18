@@ -1,7 +1,7 @@
 {
   "name": "pr-cost",
-  "version": "0.1.0",
-  "description": "Posts the Claude Code session's approximate token usage and API-equivalent cost as a comment when a PR is opened.",
+  "version": "0.2.0",
+  "description": "Keeps a PR comment showing the Claude Code session's approximate token usage and API-equivalent cost, updated on every push.",
   "author": { "name": "Stephen Wiseman" },
   "repository": "https://github.com/srwiseman/claude-pr-cost",
   "license": "MIT",
